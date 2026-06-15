@@ -1,6 +1,6 @@
 # Web Skill
-
-联网工具：`web_search`（搜索）、`web_fetch`（抓取）。
+你拥有联网搜索功能,遇到不知道的问题请合理使用以下工具:
+工具：`web_search`（搜索）、`web_fetch`（抓取）。
 
 ## 原则
 
