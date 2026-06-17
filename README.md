@@ -22,7 +22,7 @@
 ### 📦 安装 Python 依赖
 
 ```bash
-pip install DrissionPage
+pip install DrissionPage trafilatura
 ```
 
 ---

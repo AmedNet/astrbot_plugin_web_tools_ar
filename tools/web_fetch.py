@@ -1,13 +1,10 @@
-"""网页抓取工具 — 通过 DrissionPage 驱动 Edge 获取页面文本"""
+"""网页抓取工具 — 通过 DrissionPage 驱动 Edge 获取页面文本（支持真正并发）"""
 import asyncio
 import logging
-import os
-import random
+import time
 import re
 import threading
 import platform
-import tempfile
-import time
 from pathlib import Path
 
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -30,15 +27,23 @@ except ImportError:
     def field(**kwargs):
         return None
 
-_page_lock = threading.Lock()
 
+# ──────────────────────────────────────────────────────
+# 1. 端口分配：全局计数器保证每个线程拿到唯一端口
+# ──────────────────────────────────────────────────────
+_next_port = 10000
+_port_lock = threading.Lock()
 
-def _get_port():
-    """用 PID + 随机数生成独立端口，避免并发冲突"""
-    pid = os.getpid()
-    rand = random.randint(100, 999)
-    port = 10000 + (pid % 1000) * 10 + rand % 10
-    return port
+def _alloc_port() -> int:
+    """线程安全地分配一个唯一端口"""
+    global _next_port
+    with _port_lock:
+        port = _next_port
+        _next_port += 1
+        # 防止溢出，循环使用
+        if _next_port > 60000:
+            _next_port = 10000
+        return port
 
 
 def _find_edge_path() -> str:
@@ -66,21 +71,18 @@ def _find_edge_path() -> str:
     raise FileNotFoundError("未找到 Edge 浏览器，请确认已安装 Microsoft Edge")
 
 
-def _create_page():
-    port = _get_port()
-    co = ChromiumOptions()
-    co.set_browser_path(_find_edge_path())
-    co.set_argument("--disable-blink-features=AutomationControlled")
-    co.set_local_port(port)
-    with _page_lock:
-        page = ChromiumPage(addr_or_opts=co)
-    logger.info(f"web_fetch: DrissionPage(Edge) ready (port={port})")
-    return page
+# ──────────────────────────────────────────────────────
+# 2. 并发上限控制
+# ──────────────────────────────────────────────────────
+# 同时运行的 Chromium 实例上限，防止瞬间启动过多进程拖垮系统
+_MAX_CONCURRENT_BROWSERS = 4
+_browser_semaphore = threading.Semaphore(_MAX_CONCURRENT_BROWSERS)
 
+
+import trafilatura
 
 def _extract_text(page) -> str:
-    """提取页面文本（与 bing_search.py 一致的方式）"""
-    # 获取标题
+    """使用 trafilatura 提取干净的页面正文，并补充标题"""
     title = ""
     try:
         title_elem = page.ele('tag:title', timeout=3)
@@ -89,7 +91,30 @@ def _extract_text(page) -> str:
     except Exception:
         pass
 
-    # 获取 body 文本
+    # 核心改动：获取页面HTML，用 trafilatura 提取正文
+    try:
+        # 获取完整的页面HTML
+        html_content = page.html
+        # trafilatura 自动识别并提取正文，返回纯文本
+        extracted_text = trafilatura.extract(html_content, include_comments=False, include_tables=True)
+        
+        if extracted_text:
+            # 如果成功提取，清理多余空行并组合标题
+            cleaned_text = re.sub(r'\n\s*\n', '\n\n', extracted_text.strip())
+            if title:
+                return f"标题: {title}\n\n{cleaned_text}"
+            return cleaned_text
+        else:
+            # 如果 trafilatura 提取失败（比如页面结构特殊），回退到原有逻辑
+            logging.warning("trafilatura 提取为空，回退到原有提取方式")
+            return _fallback_extract_text(page, title)
+            
+    except Exception as e:
+        logging.error(f"trafilatura 提取出错: {e}，回退到原有方式")
+        return _fallback_extract_text(page, title)
+
+def _fallback_extract_text(page, title: str) -> str:
+    """原有的提取逻辑作为备用方案"""
     text = ""
     try:
         body = page.ele('tag:body', timeout=5)
@@ -99,7 +124,6 @@ def _extract_text(page) -> str:
         pass
 
     if not text or any(tag in text[:200] for tag in ['<style', '<script', 'function(']):
-        # 尝试 document.innerText（自动过滤 script/style 内容）
         try:
             raw = page.run_js("document.body?.innerText || document.body?.textContent || ''")
             if raw:
@@ -110,41 +134,71 @@ def _extract_text(page) -> str:
     if not text:
         return "页面内容为空"
 
-    # 清理多余空行
     text = re.sub(r'\n\s*\n', '\n\n', text)
-
     if title:
         text = f"标题: {title}\n\n{text}"
-
     return text
 
 
-def fetch_page(url: str, timeout: int = 10) -> str:
-    """获取指定 URL 的页面文本内容"""
-    page = None
-    try:
-        page = _create_page()
-        page.get(url, timeout=timeout)
-        page.wait.doc_loaded()
-        # 等待 body 渲染完成
-        try:
-            page.wait.ele_displayed('tag:body', timeout=10)
-        except Exception:
-            pass
-
-        text = _extract_text(page)
-
-        return text
-
-    except Exception as e:
-        logger.error(f"web_fetch 出错 ({url}): {e}")
-        return f"获取页面失败: {str(e)}"
-    finally:
-        if page:
+# ──────────────────────────────────────────────────────
+# 3. 核心抓取函数（无全局锁，线程安全，受信号量控制）
+# ──────────────────────────────────────────────────────
+def fetch_page(url: str, timeout: int = 10, retries: int = 3) -> str:
+    """
+    获取指定 URL 的页面文本内容（每次独立浏览器，通过信号量控制并发数）
+    """
+    if not url:
+        return "错误：未提供 URL"
+    
+    last_exception = None
+    
+    # 使用 with 自动获取和释放信号量
+    with _browser_semaphore:
+        for attempt in range(1, retries + 1):
+            page = None
             try:
-                page.quit()
-            except Exception:
-                pass
+                # 分配唯一端口，避免冲突
+                port = _alloc_port()
+                co = ChromiumOptions()
+                co.set_browser_path(_find_edge_path())
+                co.set_argument("--disable-blink-features=AutomationControlled")
+                co.set_local_port(port)
+                page = ChromiumPage(addr_or_opts=co)
+                logger.info(f"web_fetch: 获取页面 (url={url}, port={port})")
+                
+                page.get(url, timeout=timeout)
+                page.wait.doc_loaded()
+                # 等待 body 渲染完成
+                try:
+                    page.wait.ele_displayed('tag:body', timeout=10)
+                except Exception:
+                    pass
+
+                # 滚动加载更多结果
+                for _ in range(3):
+                    page.scroll.down(2000)
+                    time.sleep(0.5)
+
+                text = _extract_text(page)
+                return text
+                
+            except Exception as e:
+                logger.warning(f"web_fetch 尝试 {attempt}/{retries} 失败 ({url}): {e}")
+                last_exception = e
+                if attempt < retries:
+                    wait_time = 2 ** attempt  # 指数退避
+                    time.sleep(wait_time)
+                # 继续下一次
+            finally:
+                if page:
+                    try:
+                        page.quit()
+                    except Exception:
+                        pass
+                    
+    # 所有重试失败
+    error_msg = f"获取页面失败，已重试{retries}次: {last_exception}"
+    return error_msg
 
 
 # ============================================================
@@ -214,8 +268,8 @@ if __name__ == "__main__":
     else:
         urls = [
             "https://www.sina.com.cn",
-            "https://news.qq.com",
-            "https://www.baidu.com",
+            "https://www.douban.com/group/topic/490787565/?_spm_id=MjE1OTQxMjA4&_i=1664378OkdmqjU",
+            "https://www.nationalgeographic.com/travel/national-parks/article/lassen-volcanic-national-park",
         ]
 
     print(f"\n>>> 开始抓取 {len(urls)} 个页面: {urls}\n")
@@ -227,8 +281,7 @@ if __name__ == "__main__":
             print(f"\n{'='*60}")
             print(f"URL: {url}")
             print(f"{'='*60}")
-            print(text[:500])
-            print("...")
+            print(text)
 
     asyncio.run(run())
     print(f"\n{'='*60}")
