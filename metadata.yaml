@@ -1,7 +1,7 @@
 name: Bing_Web_Search
 desc: 为 LLM 提供 Bing 搜索和网页抓取能力
 author: APOLI
-version: v1.0.1
+version: v1.0.2
 repo: "Web_Search"
 display_name: 联网搜索
 short_desc: 为 LLM 提供 Bing 搜索和网页抓取能力

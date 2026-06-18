@@ -75,52 +75,12 @@ def _find_edge_path() -> str:
 
 
 # ──────────────────────────────────────────────────────
-# 2. 并发上限控制
+# 2. 并发上限控制 + 核心搜索函数
 # ──────────────────────────────────────────────────────
 # 同时运行的 Chromium 实例上限，防止瞬间启动过多进程拖垮系统
 _MAX_CONCURRENT_BROWSERS = 4
-_browser_semaphore = threading.Semaphore(_MAX_CONCURRENT_BROWSERS)
 
 
-# ──────────────────────────────────────────────────────
-# 3. 每个线程独立管理自己的 ChromiumPage（thread‑local）
-# ──────────────────────────────────────────────────────
-_thread_local = threading.local()
-
-def _get_thread_page():
-    """返回当前线程专属的 ChromiumPage，按需创建（受并发上限控制）"""
-    if not hasattr(_thread_local, "page") or _thread_local.page is None:
-        _browser_semaphore.acquire()
-        try:
-            port = _alloc_port()
-            co = ChromiumOptions()
-            co.set_browser_path(_find_edge_path())
-            co.set_argument("--disable-blink-features=AutomationControlled")
-            co.set_local_port(port)
-            page = ChromiumPage(addr_or_opts=co)
-            _thread_local.page = page
-            logger.info(f"bing_search: 线程{threading.get_ident()} 创建 Edge (port={port})")
-        except Exception:
-            _browser_semaphore.release()
-            raise
-    return _thread_local.page
-
-
-def close_all_browsers():
-    """关闭当前线程的浏览器（插件卸载/进程退出时调用）"""
-    if hasattr(_thread_local, "page") and _thread_local.page is not None:
-        try:
-            _thread_local.page.quit()
-        except Exception:
-            pass
-        _thread_local.page = None
-        _browser_semaphore.release()
-    logger.info("bing_search: 当前线程浏览器已关闭")
-
-
-# ──────────────────────────────────────────────────────
-# 4. 核心搜索函数（无全局锁，线程安全）
-# ──────────────────────────────────────────────────────
 def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
     """
     执行Bing搜索（每次独立浏览器，通过信号量控制并发数）
@@ -136,7 +96,8 @@ def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
     retry_count = 0
 
     # 使用 with 自动获取和释放信号量
-    with _browser_semaphore:
+    browser_semaphore = threading.Semaphore(_MAX_CONCURRENT_BROWSERS)
+    with browser_semaphore:
         # 分配唯一端口，避免冲突
         port = _alloc_port()
         co = ChromiumOptions()
@@ -189,9 +150,13 @@ def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
                             raise  # 3 次都空白页，抛异常走到外层 except
 
                 # 滚动加载更多结果（Bing 默认只加载前几条，滚动可触发懒加载）
-                for _ in range(3):  # 滚动3次，每次加载更多
-                    page.scroll.down(500)  # 向下滚动500像素
-                    time.sleep(0.5)        # 等待加载
+                for _ in range(3):
+                    page.scroll.down(500)
+                    # 滚动后等待新结果出现：检测 #b_results 的子元素数量是否增加
+                    try:
+                        page.wait.ele_displayed('#b_results .b_algo', timeout=1.5)
+                    except Exception:
+                        pass  # 超时也不影响，继续滚动
 
                 # 精准定位搜索结果容器
                 b_results = page.ele('#b_results', timeout=1)
@@ -249,7 +214,9 @@ def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
                             "rank": len(results) + 1
                         })
                     except Exception:
+                        logging.error("bing_search: 解析单条结果失败", exc_info=True)
                         continue
+
 
                 # 检查结果是否为空
                 if results:
@@ -276,8 +243,12 @@ def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
             }, ensure_ascii=False)
 
         except Exception as e:
-            logging.error(f"搜索出错: {e}")
-            return json.dumps({"error": f"搜索失败: {str(e)}", "query": keyword}, ensure_ascii=False)
+            logging.error(f"bing_search: 搜索 '{keyword}' 失败", exc_info=True)
+            return json.dumps({
+                "error": f"搜索失败: {type(e).__name__}: {str(e)}",
+                "query": keyword
+            }, ensure_ascii=False)
+
         finally:
             # 无论成功或失败，都关闭浏览器
             try:
