@@ -75,10 +75,10 @@ def _find_edge_path() -> str:
 
 
 # ──────────────────────────────────────────────────────
-# 2. 并发上限控制 + 核心搜索函数
+# 2. 并发上限控制 — 全局信号量（别再写成局部了😡）
 # ──────────────────────────────────────────────────────
-# 同时运行的 Chromium 实例上限，防止瞬间启动过多进程拖垮系统
 _MAX_CONCURRENT_BROWSERS = 4
+_browser_semaphore = threading.Semaphore(_MAX_CONCURRENT_BROWSERS)
 
 
 def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
@@ -95,9 +95,8 @@ def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
     max_retries = 3
     retry_count = 0
 
-    # 使用 with 自动获取和释放信号量
-    browser_semaphore = threading.Semaphore(_MAX_CONCURRENT_BROWSERS)
-    with browser_semaphore:
+    # 使用全局信号量 — 这样才真正限流
+    with _browser_semaphore:
         # 分配唯一端口，避免冲突
         port = _alloc_port()
         co = ChromiumOptions()
@@ -111,7 +110,7 @@ def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
             while retry_count < max_retries:
                 # 直接访问 Bing 首页，然后在搜索框中输入关键词
                 page.get("https://www.bing.com", timeout=timeout)
-                
+
                 # 等待搜索框出现并输入关键词
                 try:
                     search_box = page.ele('#sb_form_q', timeout=5)
@@ -149,14 +148,25 @@ def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
                         else:
                             raise  # 3 次都空白页，抛异常走到外层 except
 
-                # 滚动加载更多结果（Bing 默认只加载前几条，滚动可触发懒加载）
+                # 滚动加载更多结果 — 等待 .b_algo 数量确实增加了才继续
                 for _ in range(3):
-                    page.scroll.down(500)
-                    # 滚动后等待新结果出现：检测 #b_results 的子元素数量是否增加
+                    # 滚动前记录当前结果数
                     try:
-                        page.wait.ele_displayed('#b_results .b_algo', timeout=1.5)
+                        before = len(page.eles('#b_results .b_algo'))
                     except Exception:
-                        pass  # 超时也不影响，继续滚动
+                        before = 0
+
+                    page.scroll.down(500)
+
+                    # 轮询等待新结果出现（最多 1.5 秒）
+                    for _ in range(3):
+                        try:
+                            after = len(page.eles('#b_results .b_algo'))
+                        except Exception:
+                            after = 0
+                        if after > before:
+                            break  # 新结果到了
+                        time.sleep(0.5)
 
                 # 精准定位搜索结果容器
                 b_results = page.ele('#b_results', timeout=1)
@@ -167,12 +177,40 @@ def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
 
                 results = []
                 for li in result_items[:max_results]:
+                    # 每条的 fallback 信息
+                    fallback_text = ""
+                    try:
+                        fallback_text = li.text.strip()[:200]
+                    except Exception:
+                        pass
+
                     try:
                         h2 = li.ele('tag:h2', timeout=0.3)
                         if not h2:
+                            # 没有 h2 → 用 fallback
+                            if fallback_text and fallback_text not in ("", " "):
+                                results.append({
+                                    "title": fallback_text[:80],
+                                    "url": "",
+                                    "snippet": fallback_text,
+                                    "date": "",
+                                    "source": "",
+                                    "rank": len(results) + 1
+                                })
                             continue
+
                         a_tag = h2.ele('tag:a', timeout=0.3)
                         if not (a_tag and h2.text and a_tag.attr('href')):
+                            # 没有链接 → 用 fallback
+                            if fallback_text and fallback_text not in ("", " "):
+                                results.append({
+                                    "title": fallback_text[:80],
+                                    "url": "",
+                                    "snippet": fallback_text,
+                                    "date": "",
+                                    "source": "",
+                                    "rank": len(results) + 1
+                                })
                             continue
 
                         title = h2.text.strip()
@@ -208,13 +246,24 @@ def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
                         results.append({
                             "title": title,
                             "url": url,
-                            "snippet": snippet,
+                            "snippet": snippet or fallback_text,
                             "date": date,
                             "source": source,
                             "rank": len(results) + 1
                         })
                     except Exception:
-                        logging.error("bing_search: 解析单条结果失败", exc_info=True)
+                        # 解析失败 → fallback 兜底
+                        if fallback_text and fallback_text not in ("", " "):
+                            results.append({
+                                "title": fallback_text[:80],
+                                "url": "",
+                                "snippet": fallback_text,
+                                "date": "",
+                                "source": "",
+                                "rank": len(results) + 1
+                            })
+                        else:
+                            logging.error("bing_search: 解析单条结果失败且无 fallback", exc_info=True)
                         continue
 
 
