@@ -6,6 +6,9 @@ import threading
 import platform
 import time
 import json
+import tempfile
+import shutil
+import os
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse, quote
@@ -47,6 +50,13 @@ def _alloc_port() -> int:
             _next_port = 10000
         return port
 
+# ──────────────────────────────────────────────────────
+# 2. DrissionPage 默认 userData 目录
+# ──────────────────────────────────────────────────────
+# DrissionPage 会在系统临时目录下创建 DrissionPage/userData 存放浏览器数据
+# 每次运行后都要清理这个目录，防止磁盘被撑爆
+_DRISSIONPAGE_USERDATA = os.path.join(tempfile.gettempdir(), "DrissionPage", "userData")
+
 
 @lru_cache(maxsize=1)
 def _find_edge_path() -> str:
@@ -75,7 +85,7 @@ def _find_edge_path() -> str:
 
 
 # ──────────────────────────────────────────────────────
-# 2. 并发上限控制 — 全局信号量（别再写成局部了😡）
+# 3. 并发上限控制 — 全局信号量
 # ──────────────────────────────────────────────────────
 _MAX_CONCURRENT_BROWSERS = 4
 _browser_semaphore = threading.Semaphore(_MAX_CONCURRENT_BROWSERS)
@@ -97,12 +107,20 @@ def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
 
     # 使用全局信号量 — 这样才真正限流
     with _browser_semaphore:
-        # 分配唯一端口，避免冲突
+        # 创建临时用户数据目录，用完后删除，避免 /tmp 下 userdata 堆积
+        user_data_dir = None
         port = _alloc_port()
         co = ChromiumOptions()
         co.set_browser_path(_find_edge_path())
         co.set_argument("--disable-blink-features=AutomationControlled")
         co.set_local_port(port)
+
+        # 用 --user-data-dir 替代 set_user_data_path，更底层更可靠
+        try:
+            user_data_dir = tempfile.mkdtemp(prefix="bing_search_")
+            co.set_argument(f"--user-data-dir={user_data_dir}")
+        except Exception:
+            pass
 
         page = ChromiumPage(addr_or_opts=co)
         try:
@@ -302,6 +320,18 @@ def search_bing(keywords: list, max_results: int = 8, timeout: int = 45) -> str:
             # 无论成功或失败，都关闭浏览器
             try:
                 page.quit()
+            except Exception:
+                pass
+            # 清理我们自己创建的临时目录
+            if user_data_dir:
+                try:
+                    shutil.rmtree(user_data_dir, ignore_errors=True)
+                except Exception:
+                    pass
+            # ⚠️ 额外清理 DrissionPage 默认 userData 目录（双重保险）
+            try:
+                if os.path.isdir(_DRISSIONPAGE_USERDATA):
+                    shutil.rmtree(_DRISSIONPAGE_USERDATA, ignore_errors=True)
             except Exception:
                 pass
 

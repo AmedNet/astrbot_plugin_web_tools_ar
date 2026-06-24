@@ -6,6 +6,9 @@ import threading
 import platform
 import time
 import ipaddress
+import tempfile
+import shutil
+import os
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
@@ -49,6 +52,14 @@ def _alloc_port() -> int:
         return port
 
 
+# ──────────────────────────────────────────────────────
+# 2. DrissionPage 默认 userData 目录
+# ──────────────────────────────────────────────────────
+# DrissionPage 会在系统临时目录下创建 DrissionPage/userData 存放浏览器数据
+# 每次运行后都要清理这个目录，防止磁盘被撑爆
+_DRISSIONPAGE_USERDATA = os.path.join(tempfile.gettempdir(), "DrissionPage", "userData")
+
+
 @lru_cache(maxsize=1)
 def _find_edge_path() -> str:
     system = platform.system()
@@ -76,7 +87,7 @@ def _find_edge_path() -> str:
 
 
 # ──────────────────────────────────────────────────────
-# 2. URL 校验
+# 3. URL 校验
 # ──────────────────────────────────────────────────────
 def validate_url(url: str) -> str | None:
     """
@@ -115,7 +126,7 @@ def validate_url(url: str) -> str | None:
 
 
 # ──────────────────────────────────────────────────────
-# 3. 并发上限控制
+# 4. 并发上限控制
 # ──────────────────────────────────────────────────────
 # 同时运行的 Chromium 实例上限，防止瞬间启动过多进程拖垮系统
 _MAX_CONCURRENT_BROWSERS = 4
@@ -192,7 +203,7 @@ def _fallback_extract_text(page, title: str, max_chars: int = 10000) -> str:
 
 
 # ──────────────────────────────────────────────────────
-# 4. 核心抓取函数（无全局锁，线程安全，受信号量控制）
+# 5. 核心抓取函数（无全局锁，线程安全，受信号量控制）
 # ──────────────────────────────────────────────────────
 def fetch_page(url: str, timeout: int = 10, retries: int = 3, max_chars: int = 10000) -> str:
     """
@@ -215,6 +226,7 @@ def fetch_page(url: str, timeout: int = 10, retries: int = 3, max_chars: int = 1
     with _browser_semaphore:
         for attempt in range(1, retries + 1):
             page = None
+            user_data_dir = None
             try:
                 # 分配唯一端口，避免冲突
                 port = _alloc_port()
@@ -222,6 +234,14 @@ def fetch_page(url: str, timeout: int = 10, retries: int = 3, max_chars: int = 1
                 co.set_browser_path(_find_edge_path())
                 co.set_argument("--disable-blink-features=AutomationControlled")
                 co.set_local_port(port)
+
+                # 用 --user-data-dir 替代 set_user_data_path，更底层更可靠
+                try:
+                    user_data_dir = tempfile.mkdtemp(prefix="web_fetch_")
+                    co.set_argument(f"--user-data-dir={user_data_dir}")
+                except Exception:
+                    pass
+
                 page = ChromiumPage(addr_or_opts=co)
                 logger.info(f"web_fetch: 获取页面 (url={url}, port={port})")
 
@@ -257,6 +277,18 @@ def fetch_page(url: str, timeout: int = 10, retries: int = 3, max_chars: int = 1
                         page.quit()
                     except Exception:
                         pass
+                # 清理我们自己创建的临时目录
+                if user_data_dir:
+                    try:
+                        shutil.rmtree(user_data_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                # ⚠️ 额外清理 DrissionPage 默认 userData 目录（双重保险）
+                try:
+                    if os.path.isdir(_DRISSIONPAGE_USERDATA):
+                        shutil.rmtree(_DRISSIONPAGE_USERDATA, ignore_errors=True)
+                except Exception:
+                    pass
 
     # 所有重试失败
     error_msg = f"获取页面失败，已重试{retries}次: {last_exception}"
